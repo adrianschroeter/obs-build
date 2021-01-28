@@ -1,7 +1,7 @@
 #
 # spec file for package build
 #
-# Copyright (c) 2020 SUSE LLC
+# Copyright (c) 2021 SUSE LLC
 #
 # All modifications and additions to the file contributed by third parties
 # remain the property of their copyright owners, unless otherwise agreed
@@ -28,7 +28,7 @@ Name:           %{__pkg_name}
 Summary:        A Script to Build SUSE Linux RPMs
 License:        GPL-2.0-only OR GPL-3.0-only
 Group:          Development/Tools/Building
-Version:        20200131
+Version:        20210120
 Release:        0
 Source:         obs-build-%{version}.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-build
@@ -48,16 +48,14 @@ BuildRequires:  perl
 BuildRequires:  psmisc
 BuildRequires:  tar
 # For testcases
-BuildRequires:  perl(Date::Parse)
 BuildRequires:  perl(Test::Harness)
 BuildRequires:  perl(Test::More)
-%if 0%{?fedora}
+%if 0%{?fedora} || 0%{?centos_version}
 Requires:       perl-MD5
-Requires:       perl-TimeDate
-BuildRequires:  perl-TimeDate
+%else
+BuildRequires:  perl(Date::Parse)
 %endif
 Conflicts:      bsdtar < 2.5.5
-BuildRequires:  perl(Date::Parse)
 BuildRequires:  perl(Test::Harness)
 BuildRequires:  perl(Test::More)
 BuildRequires:  perl(YAML::LibYAML)
@@ -90,9 +88,8 @@ Recommends:     %{__pkg_name}-mkdrpms
 
 # With fedora 33 the POSIX module was split out of the perl
 # package
-BuildRequires: perl(POSIX)
-Requires: perl(POSIX)
-
+BuildRequires:  perl(POSIX)
+Requires:       perl(POSIX)
 
 %description
 This package provides a script for building RPMs for SUSE Linux in a
