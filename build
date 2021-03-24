@@ -32,6 +32,8 @@ fi
 
 BUILD_CONF=/etc/build.conf
 
+#export VM_USE_SNAPSHOT=1
+
 # ignore BUILD_DIR if we have a config
 test -e "$BUILD_CONF" && BUILD_DIR=/usr/lib/build
 
@@ -480,6 +482,7 @@ cleanup_and_exit () {
 	buildroot_umount /sys
 	buildroot_umount /dev/pts
 	buildroot_umount /dev/shm
+	test -n "$VM_VARFS" -a "$VM_VARFS" != 1 && umount $BUILD_ROOT/.build-var 2>/dev/null || true
 	test -n "$VM_ROOT" -a "$VM_ROOT" != 1 && umount $BUILD_ROOT 2>/dev/null || true
 	test -n "$VM_TYPE" && vm_cleanup
     fi
@@ -1315,6 +1318,12 @@ if test -z "$RUNNING_IN_VM" ; then
     echo Using BUILD_ARCH=$BUILD_ARCH
     test -n "$VM_TYPE" && echo "Doing $VM_TYPE build${VM_ROOT:+ in $VM_ROOT}"
     echo
+else
+    # are we coming from preinstallimage?
+    # Triggering a KVM snapshot and waiting for additional storage device for resume state
+    if test -d $BUILD_ROOT/.preinstall_image -a -n "$VM_TYPE" ; then
+       vm_handle_vmsnapshot
+    fi
 fi
 
 test "$BUILD_ARCH" = all && BUILD_ARCH=
@@ -1364,6 +1373,15 @@ for RECIPEFILE in "${RECIPEFILES[@]}" ; do
         recipe_create_changelog "$MYSRCDIR/$RECIPEFILE"
     fi
 
+set -x
+    # check for vm snapshot matching preinstallimage
+    if test -n "$RPMLIST"; then
+       image=`sed -n 's,^preinstallimage: \(.*\),\1,p' "${RPMLIST##* }"`
+       VM_SNAPSHOT="${image}.vmsnap"
+       [ -e "$VM_SNAPSHOT" ] && export VM_USE_SNAPSHOT=1
+    fi
+set +x
+read
     if test -n "$VM_TYPE" -a -z "$RUNNING_IN_VM" ; then
 	vm_first_stage
 	cleanup_and_exit

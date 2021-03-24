@@ -28,10 +28,13 @@ vm_linux_kernel_parameter="ext4.allow_unsupported=1 mitigations=off"
 
 # guest visible devices
 VM_ROOTDEV=/dev/hda1
+VM_VARFSDEV=/dev/hda3
 VM_SWAPDEV=/dev/hda2
 
 VM_TYPE=
 VM_ROOT=
+VM_VARFS=/tmp/srcroot
+VM_SNAPSHOT=/tmp/vmsnapshot
 VM_SWAP=
 VM_ROOT_TYPE=
 VM_SWAP_TYPE=
@@ -49,6 +52,7 @@ VM_CONSOLE_INPUT=
 VM_USER=
 VM_USE_MKFS_COPYIN=
 VMDISK_ROOTSIZE=4096
+VMDISK_VARFSSIZE=1024
 VMDISK_SWAPSIZE=1024
 VMDISK_FILESYSTEM=
 VMDISK_MOUNT_OPTIONS=__default
@@ -72,7 +76,7 @@ for i in ec2 emulator kvm lxc openstack qemu uml xen zvm docker pvm nspawn; do
     . "$BUILD_DIR/build-vm-$i"
 done
 
-VM_WATCHDOG=
+VM_WATCHDOG=1
 VM_WATCHDOG_PID=
 
 # the following functions just call the corresponding vm versions
@@ -98,6 +102,20 @@ vm_detach_swap() {
 
 vm_fixup() {
     vm_fixup_$VM_TYPE "$@"
+}
+
+vm_handle_vmsnapshot() {
+    vm_handle_vmsnapshot_$VM_TYPE "$@"
+}
+
+vm_snapshot() {
+    [ -z "$VM_SNAPSHOT_DONE" ] && vm_snapshot_$VM_TYPE "$@"
+    # watchdog may trigger multiple times atm
+    VM_SNAPSHOT_DONE=1
+}
+
+vm_resume() {
+    vm_resume_$VM_TYPE "$@"
 }
 
 vm_startup() {
@@ -397,6 +415,7 @@ vm_img_mkfs() {
 
     local labelopt=
     test "$VM_ROOTDEV" != "${VM_ROOTDEV#LABEL=}" && labelopt="-L ${VM_ROOTDEV#LABEL=}"
+    test "$VM_VARFSDEV" != "${VM_VARFSDEV#LABEL=}" && labelopt="-L ${VM_VARFSDEV#LABEL=}"
 
     # extend options if wanted, multiple -O are fine
     if test "$options" = "nodirindex" && test "$fs" = "ext2" -o "$fs" = "ext3" -o "$fs" = "ext4"; then
@@ -472,6 +491,7 @@ background_watchdog() {
 	case $WATCH in
 	    *VM\ INTERACTION\ START*) test -n "$WATCHDOG_START" || WATCHDOG_START=`date +%s` ;;
 	    *VM\ INTERACTION\ END*) WATCHDOG_START= ;;
+	    *VM\ INTERACTION\ SNAPSHOT*) vm_snapshot ;;
 	esac
 	if test -n "$WATCHDOG_START" ; then
 	    NOW=`date +%s`
@@ -751,15 +771,15 @@ vm_setup() {
 	fi
     fi
     # Check for populating filesystem during mkfs
-    if test -n "$VM_USE_MKFS_COPYIN" ; then
-	echo "Using mkfs copyin mode to populate the root filesystem"
-	mkdir_build_root
-        rm -rf "$BUILD_ROOT"/* "$BUILD_ROOT"/.[^.]* 
-        if test -z "$CLEAN_BUILD" -a -e "$VM_ROOT" ; then
-           echo "Recovering former build root"
-           debugfs -f <(echo rdump / "$BUILD_ROOT") "$VM_ROOT"
-        fi
-    fi
+#   if test -n "$VM_USE_MKFS_COPYIN" ; then
+#       echo "Using mkfs copyin mode to populate the root filesystem"
+#       mkdir_build_root
+#       rm -rf "$BUILD_ROOT"/* "$BUILD_ROOT"/.[^.]* 
+#       if test -z "$CLEAN_BUILD" -a -e "$VM_ROOT" ; then
+#          echo "Recovering former build root"
+#          debugfs -f <(echo rdump / "$BUILD_ROOT") "$VM_ROOT"
+#       fi
+#   fi
     local clean_build="$CLEAN_BUILD"
     if test "$VM_ROOT_TYPE" = file ; then
 	if test -z "$clean_build" ; then
@@ -772,6 +792,7 @@ vm_setup() {
 	fi
 	if test -n "$clean_build" ; then
 	    vm_img_create "$VM_ROOT" "$VMDISK_ROOTSIZE"
+	    vm_img_create "$VM_VARFS" "$VMDISK_VARFSSIZE"
 	fi
     fi
     if test ! -e "$VM_ROOT" ; then
@@ -782,6 +803,7 @@ vm_setup() {
     fi
     if test -n "$clean_build" ; then
 	vm_img_mkfs "$VMDISK_FILESYSTEM" "$VM_ROOT" "$VMDISK_FILESYSTEM_OPTIONS" || cleanup_and_exit 4
+	vm_img_mkfs "$VMDISK_FILESYSTEM" "$VM_VARFS" "$VMDISK_FILESYSTEM_OPTIONS" || cleanup_and_exit 4
     fi
     # now mount root/swap
     mkdir_build_root
@@ -792,6 +814,17 @@ vm_setup() {
 	else
 	    mount ${VMDISK_MOUNT_OPTIONS},loop $VM_ROOT $BUILD_ROOT || cleanup_and_exit 4
 	fi
+        mkdir $BUILD_ROOT/.build-var
+	if test -b $VM_VARFS ; then
+	    # mount device directly
+	    mount $VMDISK_MOUNT_OPTIONS $VM_SRC_ROOT $BUILD_ROOT/.build-var || cleanup_and_exit 4
+	else
+	    mount ${VMDISK_MOUNT_OPTIONS},loop $VM_VARFS $BUILD_ROOT/.build-var || cleanup_and_exit 4
+	fi
+        for i in build-srcdir init_b_cache; do
+          mkdir $BUILD_ROOT/.build-var/$i || cleanup_and_exit 4
+          ln -s .build-var/$i $BUILD_ROOT/.$i || cleanup_and_exit 4
+        done
     else
 	if ! mount $BUILD_ROOT; then
 	    echo "mounting the build root failed. An fstab entry is probably missing or incorrect."
@@ -861,8 +894,8 @@ vm_first_stage() {
     # start up VM, rerun ourself
     cp -a $BUILD_DIR/. $BUILD_ROOT/.build
     if ! test "$MYSRCDIR" = $BUILD_ROOT/.build-srcdir ; then
-	rm -rf "$BUILD_ROOT/.build-srcdir"
-	mkdir "$BUILD_ROOT/.build-srcdir" || cleanup_and_exit 1
+	rm -rf "$BUILD_ROOT/.build-srcdir/*"
+	[ -L "$BUILD_ROOT/.build-srcdir" ] || mkdir "$BUILD_ROOT/.build-srcdir" || cleanup_and_exit 1
 	if test "$BUILDTYPE" = kiwi -o "$BUILDTYPE" = docker -o "$BUILDTYPE" = fissile -o "$BUILDTYPE" = podman ; then
 	    cp -pRL "$MYSRCDIR"/* $BUILD_ROOT/.build-srcdir
 	else
@@ -986,8 +1019,12 @@ vm_first_stage() {
 	fi
 	check_exit
 	if test -n "$VM_USE_MKFS_COPYIN" ; then
+	    vm_img_mkfs "$VMDISK_FILESYSTEM" "$VM_VARFS" "$VMDISK_FILESYSTEM_OPTIONS" "$BUILD_ROOT/.build-srcdir" || cleanup_and_exit 4
 	    vm_img_mkfs "$VMDISK_FILESYSTEM" "$VM_ROOT" "$VMDISK_FILESYSTEM_OPTIONS" "$BUILD_ROOT" || cleanup_and_exit 4
         else
+	    if ! umount $BUILD_ROOT/.build-var; then
+		cleanup_and_exit 4
+	    fi
 	    # needs to work otherwise we have a corrupted file system
 	    if ! umount $BUILD_ROOT; then
 		test -n "$KERNEL_TEMP_DIR" && rm -rf "$KERNEL_TEMP_DIR"

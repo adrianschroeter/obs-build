@@ -202,10 +202,12 @@ vm_verify_options_kvm() {
     case $kvm_device in
 	virtio*)
 	    VM_ROOTDEV=/dev/disk/by-id/virtio-0
+	    VM_VARFSDEV=/dev/disk/by-id/virtio-2
 	    VM_SWAPDEV=/dev/disk/by-id/virtio-1
 	    ;;
 	*)
 	    VM_ROOTDEV=/dev/sda
+	    VM_VARFSDEV=/dev/sdc
 	    VM_SWAPDEV=/dev/sdb
 	    ;;
     esac
@@ -271,18 +273,53 @@ kvm_add_console_args() {
     qemu_args=("${qemu_args[@]}" -chardev socket,id=monitor,server,nowait,path="${VM_ROOT}.qemu/monitor" -mon chardev=monitor,mode=readline)
 }
 
+vm_handle_vmsnapshot_kvm() {
+    echo "### VM INTERACTION SNAPSHOT"
+    while ! test -e /dev/vdc -o -e /dev/disk/by-id/virtio-2; do
+       echo "Waiting for variable data device show up"
+       sleep 1
+    done
+    VM_VARFSDEV=/dev/vdc
+    test -e /dev/disk/by-id/virtio-2 && VM_VARFSDEV=/dev/disk/by-id/virtio-2
+    mount -n "$VM_VARFSDEV" /.build-var || cleanup_and_exit "4" "Source device $VM_VARFSDEV is not mountable"
+    for i in /.build-var/*; do
+      ln -s "$i" /.${i##*/} || cleanup_and_exit "4" "Source device $VM_VARFSDEV is not mountable"
+    done
+}
+
+vm_snapshot_kvm() {
+set -x
+    vm_send_monitor_kvm "stop"
+    vm_send_monitor_kvm "commit disk"
+    # it is not working with a too long filename, so writing to a tempfile first
+    tmpfile=`mktemp`
+    vm_send_monitor_kvm "migrate \"exec:gzip -c > $tmpfile\""
+    cp ${VM_ROOT}.qcow2 "$VM_SNAPSHOT"
+    mv -v $tmpfile "$VM_SNAPSHOT".vmstate.gz
+set +x
+    vm_resume_kvm
+}
+
+vm_resume_kvm() {
+    vm_send_monitor_kvm 'cont'
+    vm_send_monitor_kvm "drive_add 2 file=${VM_VARFS}.qcow2,format=qcow2,if=none,id=source"
+    vm_send_monitor_kvm 'device_add virtio-blk-pci,drive=source,serial=2'
+}
+
 vm_startup_kvm() {
     qemu_bin="$kvm_bin"
-    qemu_args=(-drive file="$VM_ROOT",format=raw,if=none,id=disk,cache=unsafe -device "$kvm_device",drive=disk,serial=0)
+    qemu_args=(-drive file="$VM_ROOT".qcow2,format=qcow2,if=none,id=disk,snapshot=on,cache=unsafe -device "$kvm_device",drive=disk,serial=0)
+
     if [ -n "$VM_USER" ] ; then
 	getent passwd "$VM_USER" > /dev/null || cleanup_and_exit 3 "cannot find KVM user '$VM_USER'"
     elif test $UID = 0 ; then
 	# use qemu user by default if available
-	getent passwd qemu >/dev/null && VM_USER=qemu
+#	getent passwd qemu >/dev/null && VM_USER=qemu
+ 	:
     fi
     [ -n "$VM_USER" ] && kvm_options="$kvm_options -runas $VM_USER"
     if test -n "$VM_SWAP" ; then
-	qemu_args=("${qemu_args[@]}" -drive file="$VM_SWAP",format=raw,if=none,id=swap,cache=unsafe -device "$kvm_device",drive=swap,serial=1)
+	qemu_args=("${qemu_args[@]}" -drive file="$VM_SWAP".qcow2,format=qcow2,if=none,id=swap,snapshot=on,cache=unsafe -device "$kvm_device",drive=swap,serial=1)
     fi
 
     kvm_add_console_args "$kvm_serial_device"
@@ -292,6 +329,17 @@ vm_startup_kvm() {
     elif test -n "$BUILD_JOBS" -a -n "$BUILD_THREADS" ; then
 	qemu_args=("${qemu_args[@]}" "-smp" "$BUILD_JOBS,threads=$BUILD_THREADS")
     fi
+
+    if [ -n "$VM_USE_SNAPSHOT" -a -e "${VM_SNAPSHOT}.vmstate.gz" ]; then
+       qemu-img create -f qcow2 -F qcow2 -b $VM_SNAPSHOT ${VM_ROOT}.qcow2
+       qemu_args=("${qemu_args[@]}" -incoming "exec: zcat ${VM_SNAPSHOT}.vmstate.gz")
+       (sleep 10; vm_resume_kvm ${VM_VARFS}.qcow2) &
+    else
+       qemu-img convert -f raw -O qcow2 $VM_ROOT ${VM_ROOT}.qcow2
+    fi
+    qemu-img convert -f raw -O qcow2 $VM_VARFS ${VM_VARFS}.qcow2
+    qemu-img convert -f raw -O qcow2 $VM_SWAP ${VM_SWAP}.qcow2
+
     if test "$VM_TYPE" = kvm ; then
 	test -n "$HUGETLBFSPATH" && kvm_options="$kvm_options -mem-prealloc -mem-path $HUGETLBFSPATH"
     fi
@@ -379,13 +427,17 @@ vm_cleanup_kvm() {
     :
 }
 
-vm_sysrq_kvm() {
+vm_send_monitor_kvm() {
     perl -e 'use Socket; socket(SOCK, PF_UNIX, SOCK_STREAM, 0) || die("socket: $!\n"); 
              connect(SOCK, sockaddr_un($ARGV[0])) || die("connect: $!\n");
              syswrite(SOCK, "$ARGV[1]\n");
              shutdown(SOCK, 1);
              my $output;
-             read(SOCK, $output, 8192);' "$VM_ROOT.qemu/monitor" "sendkey alt-print-$1"
+             read(SOCK, $output, 8192);' "$VM_ROOT.qemu/monitor" "$1"
+}
+
+vm_sysrq_kvm() {
+    vm_send_monitor_kvm "sendkey alt-print-$1"
 }
 
 vm_wipe_kvm() {
