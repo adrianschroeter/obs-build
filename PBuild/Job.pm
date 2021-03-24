@@ -253,6 +253,13 @@ sub createjob {
     }
     push @args, '--statistics';
     push @args, '--vm-watchdog';
+    if ($vm eq 'kvm') {
+      if ($opts->{'noclean'}) {
+        push @args, '--vm-create-late-snapshot';
+      } else {
+        push @args, '--vm-create-snapshot';
+      }
+    }
   } elsif ($vm eq 'openstack') {
     mkdir("$buildroot/.mount") unless -d "$buildroot/.mount";
     push @args, "--root=$buildroot/.mount";

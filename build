@@ -115,7 +115,6 @@ OBS_PACKAGE=
 OBSURL=
 CACHE_DIR=/var/cache/build
 BUILD_DIST_TMP=
-
 RECIPE_BUILD_START_TIME=
 CCACHE_SETUP_START_TIME=
 
@@ -365,6 +364,19 @@ Known Parameters:
 
   --vm-memory SIZEINMB
               Set amount of RAM for VMs
+
+  --vm-create-snapshot
+              Creating a VM snapshot after bootup. This snapshot will be
+              resued for following builds as a base.
+              An existing snapshot will be used directly, except a --clean
+              build is running.
+
+  --vm-create-late-snapshot
+              Same as --vm-create-snapshot, but creating the snapshot
+              after installing all packages. This is not a clean environment
+              but decreases turn around times for developing.
+              An existing snapshot will be used directly, except a --clean
+              build is running.
 
   --vm-hugetlbfs HUGETLBFSPATH
               Use hugetlb for memory management, path to mounted hugetlbfs.
@@ -701,12 +713,13 @@ copy_oldpackages() {
     local d
     local dest
     test -z "$RUNNING_IN_VM" || return 0
+    dest="$BUILD_ROOT/.build.oldpackages"
+    test -n "$VM_USE_SNAPSHOT" && dest="${VM_ROOT}.qemu/.build.oldpackages"
     if test -z "$old_packages" ; then
-	rm -rf "$BUILD_ROOT"/.build.oldpackages*
+	rm -rf "$dest"
 	return 0
     fi
     for d in "${old_packages[@]}"; do
-	dest="$BUILD_ROOT/.build.oldpackages"
 	test "$i" = 0 || dest="$dest$i"
 	if test -d "$d" -a "$d" != "$dest" ; then
 	    rm -rf "$dest"
@@ -1315,6 +1328,11 @@ if test -z "$RUNNING_IN_VM" ; then
     echo Using BUILD_ARCH=$BUILD_ARCH
     test -n "$VM_TYPE" && echo "Doing $VM_TYPE build${VM_ROOT:+ in $VM_ROOT}"
     echo
+else
+    # Triggering a KVM snapshot and restarting the build script afterwards
+    if test -z "$VM_2ND_STAGE_RERUN" -a -z "$VM_LATE_SNAPSHOT" -a -n "$VM_CREATE_SNAPSHOT"; then
+        vm_handle_snapshot
+    fi
 fi
 
 test "$BUILD_ARCH" = all && BUILD_ARCH=
@@ -1364,6 +1382,27 @@ for RECIPEFILE in "${RECIPEFILES[@]}" ; do
         recipe_create_changelog "$MYSRCDIR/$RECIPEFILE"
     fi
 
+    # define vm snapshot file
+    if test "$UID" != "0" -o -n "$VM_CREATE_SNAPSHOT"; then
+       VM_SNAPSHOT="${VM_ROOT}.vmsnapshot"
+    fi
+    # different file name for late snapshots, since they are not clean builds
+    if test -n "$VM_LATE_SNAPSHOT"; then
+       VM_SNAPSHOT="${VM_ROOT}.vmlatesnapshot"
+    fi
+    if test -n "$RPMLIST"; then
+       image=`sed -n 's,^preinstallimage: \(.*\),\1,p' "${RPMLIST##* }"`
+       test -n "$image" && VM_SNAPSHOT="${image}.vmsnapshot"
+    fi
+    # late snapshots can only be used for non clean builds
+    [ -e "$VM_SNAPSHOT" -a -n "$VM_LATE_SNAPSHOT" -a -z "$CLEAN_BUILD" ] && export VM_USE_SNAPSHOT=1
+    # normal snapshots can always be used, when existing
+    [ -e "$VM_SNAPSHOT" -a -z "$VM_LATE_SNAPSHOT" ] && export VM_USE_SNAPSHOT=1
+    if test "$UID" != "0" -a -n "$image"; then
+       echo ERROR: preinstallimage usage is not working as user
+       exit 1
+    fi
+
     if test -n "$VM_TYPE" -a -z "$RUNNING_IN_VM" ; then
 	vm_first_stage
 	cleanup_and_exit
@@ -1388,6 +1427,12 @@ for RECIPEFILE in "${RECIPEFILES[@]}" ; do
         start_time=`date +%s`
 	"$@" || cleanup_and_exit 1
 	check_exit
+
+	# The late snapshot, for local development only, not for clean builds
+        if test -z "$VM_2ND_STAGE_RERUN" -a -n "$VM_LATE_SNAPSHOT" -a -n "$VM_CREATE_SNAPSHOT"; then
+            vm_handle_snapshot
+        fi
+
         TIME_INSTALL=$(( `date +%s` - $start_time ))
         unset start_time
 	# arbitrary limit of 10MB

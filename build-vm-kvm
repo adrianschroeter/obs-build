@@ -271,9 +271,55 @@ kvm_add_console_args() {
     qemu_args=("${qemu_args[@]}" -chardev socket,id=monitor,server,nowait,path="${VM_ROOT}.qemu/monitor" -mon chardev=monitor,mode=readline)
 }
 
+vm_handle_snapshot_kvm() {
+    echo "### VM INTERACTION SNAPSHOT"
+    echo "Waiting for migration and that the device to import variable data shows up"
+    while ! test -e /dev/virtio-ports/vardata; do
+       sleep .1
+    done
+    # ensure that old vardata should not be part of snapshot
+    rm -rf /.build-srcdir
+    tar xf /dev/virtio-ports/vardata -C /
+}
+
+vm_snapshot_kvm() {
+    vm_send_monitor_kvm "stop"
+    vm_send_monitor_kvm "commit disk"
+    # it is not working with a too long filename, so writing to a tempfile first
+    tmpfile=`mktemp`
+    # FIXME: VM_USER is not set here, but can't we get rid of it complete anyway?
+    test "$UID" = "0" && chown "qemu" $tmpfile
+    vm_send_monitor_kvm "migrate \"exec:gzip -c > $tmpfile\""
+    cp ${VM_ROOT}.qcow2 "$VM_SNAPSHOT"
+    mv -v $tmpfile "$VM_SNAPSHOT".vmstate.gz
+    vm_resume_kvm
+}
+
+vm_resume_kvm() {
+    # Keep retrying until a resume event happens. The continue command is always accepted
+    while ! perl -e 'use Socket; socket(SOCK, PF_UNIX, SOCK_STREAM, 0) || die("socket: $!\n");
+              connect(SOCK, sockaddr_un($ARGV[0])) || die("connect: $!\n");
+              syswrite(SOCK, "$ARGV[1]\n");
+              shutdown(SOCK, 1);
+              my $output;
+              read(SOCK, $output, 8192); print "$output\n";' "${VM_ROOT}.qemu/qmp" '{"execute": "qmp_capabilities"} {"execute": "cont", "arguments": {}}' | grep -q RESUME; do
+       echo -n .
+    done
+
+    pushd ${VM_ROOT}.qemu/vardata/
+    tar cf ${VM_ROOT}.qemu/vardata.fifo .
+    popd
+}
+
 vm_startup_kvm() {
     qemu_bin="$kvm_bin"
-    qemu_args=(-drive file="$VM_ROOT",format=raw,if=none,id=disk,cache=unsafe -device "$kvm_device",drive=disk,serial=0)
+    if test -n "$VM_SNAPSHOT"; then
+        qemu_args=(-drive file="$VM_ROOT".qcow2,format=qcow2,if=none,id=disk,cache=unsafe)
+    else
+        qemu_args=(-drive file="$VM_ROOT",format=raw,if=none,id=disk,cache=unsafe)
+    fi
+    qemu_args=("${qemu_args[@]}" -device "$kvm_device",drive=disk,serial=0)
+
     if [ -n "$VM_USER" ] ; then
 	getent passwd "$VM_USER" > /dev/null || cleanup_and_exit 3 "cannot find KVM user '$VM_USER'"
     elif test $UID = 0 ; then
@@ -290,8 +336,29 @@ vm_startup_kvm() {
     if test -n "$BUILD_JOBS" -a "$icecream" = 0 -a -z "$BUILD_THREADS" ; then
 	qemu_args=("${qemu_args[@]}" "-smp" "$BUILD_JOBS")
     elif test -n "$BUILD_JOBS" -a -n "$BUILD_THREADS" ; then
-	qemu_args=("${qemu_args[@]}" "-smp" "$BUILD_JOBS,threads=$BUILD_THREADS")
+        qemu_args=("${qemu_args[@]}" "-smp" "$BUILD_JOBS,threads=$BUILD_THREADS")
     fi
+
+    # setup the vardata import device
+    if ! test -e "${VM_ROOT}.qemu/vardata.fifo"; then
+        mkdir -p "${VM_ROOT}.qemu"
+        mkfifo "${VM_ROOT}.qemu/vardata.fifo"
+        test -n "$VM_USER" && chown "$VM_USER" "${VM_ROOT}.qemu"
+    fi
+    qemu_args=("${qemu_args[@]}" -device virtio-serial-pci -chardev pipe,id=vardata,server,nowait,path="${VM_ROOT}.qemu/vardata.fifo" -device virtserialport,chardev=vardata,name=vardata)
+
+    mkfifo ${VM_ROOT}.qemu/qmp
+    qemu_args=("${qemu_args[@]}" -qmp unix:${VM_ROOT}.qemu/qmp,server,nowait)
+    if test -n "$VM_USE_SNAPSHOT" -a -e "${VM_SNAPSHOT}.vmstate.gz"; then
+       qemu-img create -f qcow2 -F qcow2 -b $VM_SNAPSHOT ${VM_ROOT}.qcow2
+       test "$UID" = "0" && chown qemu "${VM_ROOT}.qcow2"
+       qemu_args=("${qemu_args[@]}" -incoming "exec: zcat ${VM_SNAPSHOT}.vmstate.gz")
+       vm_resume_kvm &
+    elif test -n "$VM_CREATE_SNAPSHOT"; then
+       qemu-img convert -f raw -O qcow2 $VM_ROOT ${VM_ROOT}.qcow2
+       test "$UID" = "0" && chown qemu "${VM_ROOT}.qcow2"
+    fi
+
     if test "$VM_TYPE" = kvm ; then
 	test -n "$HUGETLBFSPATH" && kvm_options="$kvm_options -mem-prealloc -mem-path $HUGETLBFSPATH"
     fi
@@ -379,13 +446,18 @@ vm_cleanup_kvm() {
     :
 }
 
-vm_sysrq_kvm() {
-    perl -e 'use Socket; socket(SOCK, PF_UNIX, SOCK_STREAM, 0) || die("socket: $!\n"); 
+vm_send_monitor_kvm() {
+   perl -e 'use Socket; socket(SOCK, PF_UNIX, SOCK_STREAM, 0) || die("socket: $!\n"); 
              connect(SOCK, sockaddr_un($ARGV[0])) || die("connect: $!\n");
              syswrite(SOCK, "$ARGV[1]\n");
              shutdown(SOCK, 1);
              my $output;
-             read(SOCK, $output, 8192);' "$VM_ROOT.qemu/monitor" "sendkey alt-print-$1"
+             read(SOCK, $output, 8192);' "$VM_ROOT.qemu/monitor" "$1"
+   return $?
+}
+
+vm_sysrq_kvm() {
+    vm_send_monitor_kvm "sendkey alt-print-$1"
 }
 
 vm_wipe_kvm() {

@@ -32,6 +32,7 @@ VM_SWAPDEV=/dev/hda2
 
 VM_TYPE=
 VM_ROOT=
+VM_SNAPSHOT=
 VM_SWAP=
 VM_ROOT_TYPE=
 VM_SWAP_TYPE=
@@ -48,6 +49,9 @@ VM_TELNET=
 VM_CONSOLE_INPUT=
 VM_USER=
 VM_USE_MKFS_COPYIN=
+VM_WATCHDOG=
+VM_CREATE_SNAPSHOT=
+VM_LATE_SNAPSHOT=
 VMDISK_ROOTSIZE=4096
 VMDISK_SWAPSIZE=1024
 VMDISK_FILESYSTEM=
@@ -72,7 +76,6 @@ for i in ec2 emulator kvm lxc openstack qemu uml xen zvm docker pvm nspawn; do
     . "$BUILD_DIR/build-vm-$i"
 done
 
-VM_WATCHDOG=
 VM_WATCHDOG_PID=
 
 # the following functions just call the corresponding vm versions
@@ -98,6 +101,30 @@ vm_detach_swap() {
 
 vm_fixup() {
     vm_fixup_$VM_TYPE "$@"
+}
+
+vm_handle_snapshot() {
+    # inside of the VM.
+    if test -z "$VM_2ND_STAGE_RERUN"; then
+       export VM_2ND_STAGE_RERUN=1
+       vm_handle_snapshot_$VM_TYPE "$@"
+       # we are maybe resumed here with new build or new build script
+       echo "Build resumed, restarting script"
+       exec /.build/build
+   fi
+   # we may have left here in any resumed VM
+}
+
+vm_snapshot() {
+    # used in external build script to trigger the snapshot
+    [ -z "$VM_SNAPSHOT_DONE" ] && vm_snapshot_$VM_TYPE "$@"
+    # watchdog may trigger multiple times atm
+    VM_SNAPSHOT_DONE=1
+}
+
+vm_resume() {
+    # used in external build script to trigger the resume
+    vm_resume_$VM_TYPE "$@"
 }
 
 vm_startup() {
@@ -229,6 +256,15 @@ vm_parse_options() {
 	# delete old root/swap to get rid of the old blocks
         VMDISK_CLEAN=true
       ;;
+      -vm-create-snapshot)
+        VM_CREATE_SNAPSHOT=1
+        VM_WATCHDOG=1
+      ;;
+      -vm-create-late-snapshot)
+        VM_CREATE_SNAPSHOT=1
+        VM_WATCHDOG=1
+        VM_LATE_SNAPSHOT=1
+      ;;
       -vm-hugetlbfs|-hugetlbfs)
 	needarg
 	HUGETLBFSPATH="$ARG"
@@ -352,6 +388,9 @@ vm_img_create() {
             fi
         fi
     fi
+    # root qemu is running as qemu and must be able to reopen the device
+    # VM_USER is not set here
+    test "$UID" = "0" && chown qemu "$img"
 }
 
 vm_img_wipe() {
@@ -472,6 +511,7 @@ background_watchdog() {
 	case $WATCH in
 	    *VM\ INTERACTION\ START*) test -n "$WATCHDOG_START" || WATCHDOG_START=`date +%s` ;;
 	    *VM\ INTERACTION\ END*) WATCHDOG_START= ;;
+	    *VM\ INTERACTION\ SNAPSHOT*) vm_snapshot ;;
 	esac
 	if test -n "$WATCHDOG_START" ; then
 	    NOW=`date +%s`
@@ -568,6 +608,9 @@ vm_detect_2nd_stage() {
 	exec perl -e 'syscall(136, '$PERSONALITY') == -1 && warn("personality: $!\n");exec "/.build/build" || die("/.build/build: $!\n")'
     fi
     RUNNING_IN_VM=true
+
+    test -n "$VM_2ND_STAGE_RERUN" && return 0
+
     test -e /proc/version || mount -orw -n -tproc none /proc
     if test "$VM_TYPE" != lxc -a "$VM_TYPE" != docker -a "$VM_TYPE" != nspawn ; then
 	mount -n ${VMDISK_MOUNT_OPTIONS},remount,rw /
@@ -751,9 +794,9 @@ vm_setup() {
 	fi
     fi
     # Check for populating filesystem during mkfs
-    if test -n "$VM_USE_MKFS_COPYIN" ; then
-	echo "Using mkfs copyin mode to populate the root filesystem"
-	mkdir_build_root
+    if test -n "$VM_USE_MKFS_COPYIN" -a "$UID" = "0"; then
+        echo "Using mkfs copyin mode to populate the root filesystem"
+        mkdir_build_root
         rm -rf "$BUILD_ROOT"/* "$BUILD_ROOT"/.[^.]* 
         if test -z "$CLEAN_BUILD" -a -e "$VM_ROOT" ; then
            echo "Recovering former build root"
@@ -918,6 +961,8 @@ vm_first_stage() {
     echo "KIWI_PARAMETERS='${KIWI_PARAMETERS//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
     echo "VM_TELNET='${VM_TELNET//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
     echo "VM_CONSOLE_INPUT='${VM_CONSOLE_INPUT//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
+    echo "VM_CREATE_SNAPSHOT='${VM_CREATE_SNAPSHOT//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
+    echo "VM_LATE_SNAPSHOT='${VM_LATE_SNAPSHOT//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
     test -n "$VM_SWAP" && echo "VM_SWAP='${VM_SWAPDEV//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
     test -n "$VMDISK_MOUNT_OPTIONS" && echo "VMDISK_MOUNT_OPTIONS='${VMDISK_MOUNT_OPTIONS//"'"/$Q}'" >> $BUILD_ROOT/.build/build.data
     PERSONALITY=0
@@ -985,6 +1030,12 @@ vm_first_stage() {
 	    fi
 	fi
 	check_exit
+
+        # FIXME: optimize the entire copying of sources away in KVM build case and write direct
+        rm -rf ${VM_ROOT}.qemu/vardata/
+        mkdir -p ${VM_ROOT}.qemu/vardata/
+        cp -a $BUILD_ROOT/.build $BUILD_ROOT/.build-srcdir $BUILD_ROOT/.init_b_cache ${VM_ROOT}.qemu/vardata/ || cleanup_and_exit 4
+
 	if test -n "$VM_USE_MKFS_COPYIN" ; then
 	    vm_img_mkfs "$VMDISK_FILESYSTEM" "$VM_ROOT" "$VMDISK_FILESYSTEM_OPTIONS" "$BUILD_ROOT" || cleanup_and_exit 4
         else
@@ -1034,7 +1085,11 @@ vm_first_stage() {
 	    mkdir -p $BUILD_ROOT/.build.packages
 	    cd $BUILD_ROOT/.build.packages || cleanup_and_exit 1
 	    echo "build: extracting built packages..."
-	    extractbuild --disk "$VM_ROOT" --input "$VM_SWAP" --skip 512 -v || cleanup_and_exit 3
+	    if test -e "$VM_SNAPSHOT"; then
+	      extractbuild --qcow --disk "${VM_ROOT}.qcow2" --input "$VM_SWAP" --skip 512 -v || cleanup_and_exit 3
+            else
+	      extractbuild --disk "$VM_ROOT" --input "$VM_SWAP" --skip 512 -v || cleanup_and_exit 3
+            fi
 	    if test "$DO_STATISTICS" = 1 ; then
 		mkdir -p OTHER
 		TIME_TOTAL=$(( `date +%s` - $TIME_START_TIME ))
