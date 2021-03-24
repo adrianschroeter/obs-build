@@ -38,7 +38,7 @@ sub read_blob {
 sub qcow_open {
   my ($fd) = @_;
   my @hdr = unpack("N*", read_blob($fd, 72, 0));
-  die("now a qcow image\n") unless $hdr[0] == 0x514649fb;
+  die("not a qcow image\n") unless $hdr[0] == 0x514649fb;
   die("unsupported qcow2 version $hdr[1]\n") unless $hdr[1] == 2 || $hdr[1] == 3;
   die("illegal cluster bits size $hdr[5]\n") if $hdr[5] < 9 || $hdr[5] > 24;
   die("encrypted qcow image\n") if $hdr[8];
