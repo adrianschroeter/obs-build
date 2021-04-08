@@ -29,6 +29,7 @@ my $dtd_pbuild = [
     'pbuild' =>
      [[ 'preset' =>
 	    'name',
+	    [],
  	    'default',
 	    'arch',
 	  [ 'config' ],
