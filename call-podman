@@ -34,7 +34,7 @@ while test -n "$1" ; do
 done
 
 if test -z "$IS_UNSHARED" ; then
-    echo "Unsharing environment"
+    [ -n "$CALL_PODMAN_SILENT" ] || echo "Unsharing environment"
     # unshare mounts and network
     exec unshare -m -n $BUILD_DIR/call-podman --isunshared --root "$BUILD_ROOT" "$@"
     cleanup_and_exit 1 "exec unshare returned"
