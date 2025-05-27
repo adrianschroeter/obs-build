@@ -277,6 +277,12 @@ recipe_build_docker() {
 	echo "Building image $ALLTAGS"
     fi
 
+    platform=$(queryconfig --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH" buildflags container-build-platform)
+    if test -n "$platform"; then
+	buildargs[${#buildargs[@]}]='--platform'
+	buildargs[${#buildargs[@]}]="$platform"
+    fi
+
     if test "$BUILDENGINE" = podman; then
 	test -n "$squashopt" && squashopt="--layers=false"
         buildformat=$(queryconfig --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH" buildflags container-build-format)
