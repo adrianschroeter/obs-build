@@ -1295,14 +1295,16 @@ sub spdx3_gen_spdxid {
 }
 
 sub spdx3_encode_header {
-  my ($subjectname, $type, $disturl, $vcs, $rootp) = @_;
+  my ($subjectname, $type, $disturl, $vcs, $rootp, $agentname, $agentspdxid) = @_;
   my $doc = [];
   push @$doc, [ '1', [], {}, {}];
   my $tool = { 'type' => 'Tool', 'name' => "$tool_name-$tool_version", 'creationInfo' => '_:creationInfo_0' };
   spdx3_gen_spdxid($doc, $tool);
-  my $ci = { '@id' => '_:creationInfo_0', 'type' => 'CreationInfo', 'specVersion' => '3.0.1', 'createdUsing' => [ $tool->{'spdxId'} ], 'created' => rfc3339time($buildtime) };
+  my $agent = { 'type' => 'SoftwareAgent', 'name' => $agentname, 'creationInfo' => '_:creationInfo_0' };
+  $agent->{'spdxId'} = $agentspdxid;
+  my $ci = { '@id' => '_:creationInfo_0', 'type' => 'CreationInfo', 'specVersion' => '3.0.1', 'createdBy' => [ $agent->{'spdxId'} ], 'createdUsing' => [ $tool->{'spdxId'} ], 'created' => rfc3339time($buildtime) };
   push @{$doc->[0]->[1]}, \$ci->{'createdUsing'}->[0];
-  push @$doc, $ci, $tool;
+  push @$doc, $ci, $tool, $agent;
   my $document = { 'type' => 'SpdxDocument', 'dataLicense' => 'http://spdx.org/licenses/CC0-1.0', 'creationInfo' => '_:creationInfo_0' };
   $document->{'spdxId'} = 'document0';
   push @{$doc->[0]->[1]}, \$document->{'spdxId'};
@@ -1366,6 +1368,17 @@ Supported content
   --container-oci-archive CONTAINER_ARCHIVE
      An container archive providing a system
 
+createdBy agent
+===============
+
+   The createdBy field of the SBOM creationInfo references a SoftwareAgent.
+   By default a SoftwareAgent named 'build' with the spdxId
+   https://www.openSUSE.org/Agent/build is used.
+
+  --obsname NAME
+     Use the name 'Open Build Service' and use
+     https://NAME/Agent/OBS-Service as the agent's spdxId instead.
+
 ";
 }
 
@@ -1390,6 +1403,7 @@ my $known_options = {
   'configdir' => ':',
   'no-files-generation' => '',
   'buildtime' => ':',
+  'obsname' => ':',
 };
 
 my ($opts, @args) = Build::Options::parse_options($known_options, @ARGV);
@@ -1425,6 +1439,13 @@ my $no_files_generation = $opts->{'no-files-generation'};
 $no_files_generation = ($config->{'buildflags:spdx-files-generation'} || '') eq 'no' unless defined $no_files_generation;
 
 $buildtime = $opts->{'buildtime'} || time();
+
+my $agent_name = 'build';
+my $agent_spdxid = 'https://www.openSUSE.org/Agent/build';
+if ($opts->{'obsname'}) {
+  $agent_name = 'Open Build Service';
+  $agent_spdxid = "https://$opts->{'obsname'}/Agent/OBS-Service";
+}
 
 my $targettype;
 my $unpackdir;
@@ -1609,7 +1630,7 @@ if ($opts->{'format'} eq 'spdx') {
     primaryPackagePurpose => $targettype,
     skip_external_refs => 1
   };
-  $doc = spdx3_encode_header($subjectname, $targettype, $opts->{'disturl'}, $opts->{'vcs'}, $rootpkg);
+  $doc = spdx3_encode_header($subjectname, $targettype, $opts->{'disturl'}, $opts->{'vcs'}, $rootpkg, $agent_name, $agent_spdxid);
   for my $p (@$pkgs) {
     spdx3_encode_pkg($doc, $p, $distro, $pkgtype);
   }
